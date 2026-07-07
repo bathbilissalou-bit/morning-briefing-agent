@@ -196,15 +196,17 @@ def check_calendar(hours_ahead: int = 24) -> dict:
 
 @tool
 def check_slack(hours_back: int = 12, max_channels: int = 5) -> dict:
-    """Fetch recent Slack messages from the most recently active channels.
+    """Fetch recent Slack messages from channels.
 
     #Args:
         hours_back: How many hours back to fetch messages (default: 12).
-        max_channels: Number of most recently active channels to check (default: 5).
+        max_channels: Number of channels to check (default: 5).
 
     #Returns:
         Channel names and up to 5 recent messages per channel.
     """
+    import time
+
     token = os.getenv("SLACK_BOT_TOKEN")
     if not token:
         return {
@@ -212,48 +214,81 @@ def check_slack(hours_back: int = 12, max_channels: int = 5) -> dict:
             "content": [{"text": "SLACK_BOT_TOKEN was not found in the .env file."}],
         }
 
+    def _retry_after_seconds(error: SlackApiError) -> int:
+        headers = error.response.headers
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        return int(retry_after) if retry_after is not None else 1
+
+    def _is_ratelimited(error: SlackApiError) -> bool:
+        return error.response.get("error") == "ratelimited"
+
+    def _call_with_rate_limit(call_fn):
+        try:
+            return call_fn(), None
+        except SlackApiError as error:
+            if not _is_ratelimited(error):
+                return None, error
+            time.sleep(_retry_after_seconds(error))
+            try:
+                return call_fn(), None
+            except SlackApiError as retry_error:
+                return None, retry_error
+
     try:
         client = WebClient(token=token)
         oldest = str(
             (datetime.now(timezone.utc) - timedelta(hours=hours_back)).timestamp()
         )
 
-        channel_activity = []
-        cursor = None
-        while True:
-            response = client.conversations_list(
+        list_response, list_error = _call_with_rate_limit(
+            lambda: client.conversations_list(
                 types="public_channel,private_channel",
                 exclude_archived=True,
-                limit=200,
-                cursor=cursor,
+                limit=max_channels,
             )
-            for channel in response.get("channels", []):
-                try:
-                    history = client.conversations_history(
-                        channel=channel["id"],
-                        limit=1,
-                    )
-                    messages = history.get("messages", [])
-                    if messages:
-                        last_active = float(messages[0]["ts"])
-                        channel_activity.append((last_active, channel))
-                except SlackApiError:
-                    continue
-
-            cursor = response.get("response_metadata", {}).get("next_cursor")
-            if not cursor:
-                break
-
-        channel_activity.sort(key=lambda item: item[0], reverse=True)
-        top_channels = channel_activity[:max_channels]
+        )
+        if list_error is not None:
+            if _is_ratelimited(list_error):
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "Slack API rate limit exceeded after one retry. "
+                                "Please try again later."
+                            )
+                        }
+                    ],
+                }
+            return {
+                "status": "error",
+                "content": [{"text": f"Failed to fetch Slack channels: {list_error}"}],
+            }
 
         results = []
-        for _, channel in top_channels:
-            history = client.conversations_history(
-                channel=channel["id"],
-                oldest=oldest,
-                limit=5,
+        for channel in list_response.get("channels", []):
+            history, history_error = _call_with_rate_limit(
+                lambda ch=channel: client.conversations_history(
+                    channel=ch["id"],
+                    oldest=oldest,
+                    limit=5,
+                )
             )
+            if history_error is not None:
+                if _is_ratelimited(history_error):
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    "Slack API rate limit exceeded after one retry. "
+                                    "Please try again later."
+                                )
+                            }
+                        ],
+                    }
+                continue
+
             messages = []
             for message in history.get("messages", []):
                 if message.get("subtype"):
